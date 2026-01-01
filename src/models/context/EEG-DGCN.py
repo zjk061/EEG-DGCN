@@ -189,7 +189,6 @@ class LightGCNBase(nn.Module):
 							help='Number of LightGCN layers.')
 		return parser
 	
-	@staticmethod
 	def build_adjmat(user_count, item_count, train_mat, selfloop_flag=False):
 		R = sp.dok_matrix((user_count, item_count), dtype=np.float32)
 		for user in train_mat:
@@ -205,11 +204,9 @@ class LightGCNBase(nn.Module):
        
 		def normalized_adj_single(adj):
 			rowsum = np.array(adj.sum(1)) + 1e-10
-
 			d_inv_sqrt = np.power(rowsum, -0.5).flatten()
 			d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
 			d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-
 			bi_lap = d_mat_inv_sqrt.dot(adj).dot(d_mat_inv_sqrt)
 			return bi_lap.tocoo()
         
@@ -228,12 +225,53 @@ class LightGCNBase(nn.Module):
 		self._base_define_params()
 		self.user_meta_data = corpus.user_features
 		self.item_meta_data = corpus.item_features
+
 		self.context_encoder = nn.Linear(1,16)
-		self.fc = nn.Sequential(
-            nn.Linear(64 + 64 + 16*7, 64),  # 64(user) + 64(item) + 16*6(context features) + 16(EEG)
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+		self.token_dim = 64
+		self.user_token_proj = nn.Linear(64, self.token_dim)
+		self.item_token_proj = nn.Linear(64, self.token_dim)
+		self.eeg_token_proj = nn.Linear(16, self.token_dim)
+		self.context_token_proj = nn.Linear(16, self.token_dim)
+		
+		self.token_gate = nn.Sequential(
+			nn.Linear(self.token_dim, self.token_dim),
+			nn.GELU(),
+			nn.Linear(self.token_dim, 1),
+			nn.Sigmoid()
+		)
+		
+		self.self_attn = nn.MultiheadAttention(
+			embed_dim=self.token_dim,
+			num_heads=4,
+			batch_first=True,
+			dropout=0.1
+		)
+		
+		self.global_token = nn.Parameter(torch.randn(1, 1, self.token_dim))
+		self.cross_attn = nn.MultiheadAttention(
+			embed_dim=self.token_dim,
+			num_heads=4,
+			batch_first=True,
+			dropout=0.1
+		)
+		
+		self.norm_tokens = nn.LayerNorm(self.token_dim)
+		self.norm_global = nn.LayerNorm(self.token_dim)
+		self.norm_ffn = nn.LayerNorm(self.token_dim)
+		
+		self.ffn = nn.Sequential(
+			nn.Linear(self.token_dim, self.token_dim * 2),
+			nn.GELU(),
+			nn.Dropout(0.1),
+			nn.Linear(self.token_dim * 2, self.token_dim)
+		)
+		
+		self.predictor = nn.Sequential(
+			nn.Linear(self.token_dim, self.token_dim // 2),
+			nn.GELU(),
+			nn.Dropout(0.1),
+			nn.Linear(self.token_dim // 2, 1)
+		)
 		self.apply(self.init_weights)
 	
 	def _base_define_params(self):
@@ -259,38 +297,40 @@ class LightGCNBase(nn.Module):
 		# combined = torch.cat([u_embed, i_embed], dim=-1)  # [batch, 64+64+16]
 		for feature in self.context_emb:
 			combined = torch.cat([combined, feature], dim=-1)
-		prediction = self.fc(combined).squeeze(-1) # [batch_size]
+				
+		batch_size = u_embed.shape[0]
+		
+		token_list = [
+			self.user_token_proj(u_embed),
+			self.item_token_proj(i_embed),
+			self.eeg_token_proj(eeg_emb)
+		]
+		for ctx_emb in self.context_emb:
+			token_list.append(self.context_token_proj(ctx_emb))
+		tokens = torch.stack(token_list, dim=1)  # [batch_size, num_tokens, token_dim]
+		
+		token_gates = self.token_gate(tokens)  # [batch_size, num_tokens, 1]
+		tokens = tokens * token_gates
+		
+		attn_output, _ = self.self_attn(tokens, tokens, tokens)
+		tokens = self.norm_tokens(tokens + attn_output)
+		
+		global_token = self.global_token.expand(batch_size, -1, -1)  # [batch_size, 1, token_dim]
+		global_attn_output, _ = self.cross_attn(global_token, tokens, tokens)
+		global_token = self.norm_global(global_token + global_attn_output)
+		
+		ffn_output = self.ffn(global_token)
+		global_token = self.norm_ffn(global_token + ffn_output)
+		
+		fused_feat = global_token.squeeze(1)  # [batch_size, token_dim]
+		prediction = self.predictor(fused_feat).squeeze(-1)
 	
-
-		# prediction = (u_embed[:, None, :] * i_embed).sum(dim=-1)  # [batch_size, -1]
 		u_v = u_embed.repeat(1,items.shape[1]).view(items.shape[0],items.shape[1],-1)
 		i_v = i_embed
 		return {'prediction': prediction.view(feed_dict['batch_size'], -1), 'u_v': u_v, 'i_v':i_v}
 
-class LightGCN(GeneralModel, LightGCNBase):
-	reader = 'BaseReader'
-	runner = 'BaseRunner'
-	extra_log_args = ['emb_size', 'n_layers', 'batch_size']
-
-	@staticmethod
-	def parse_model_args(parser):
-		parser = LightGCNBase.parse_model_args(parser)
-		return GeneralModel.parse_model_args(parser)
-
-	def __init__(self, args, corpus):
-		GeneralModel.__init__(self, args, corpus)
-		self._base_init(args, corpus)
-		# EEG GCN
-		self.eeg_num_nodes = 62
-		self.eeg_edge_index = build_fully_connected_edge_index(self.eeg_num_nodes)
-		self.eeg_gcn_encoder = EEGGCNEncoder(in_channels=5, hidden_channels=32, out_channels=16, edge_index=self.eeg_edge_index)
-
-	def forward(self, feed_dict):
-		out_dict = LightGCNBase.forward(self, feed_dict)
-		return {'prediction': out_dict['prediction']}
-
 # EEG-DGCN
-class CTRLightGCNCTR(ContextCTRModel, LightGCNBase):
+class EEG-DGCN(ContextCTRModel, LightGCNBase):
 	reader = 'ContextReader'
 	runner = 'CTRRunner'
 	extra_log_args = ['emb_size', 'n_layers', 'batch_size']
@@ -314,23 +354,6 @@ class CTRLightGCNCTR(ContextCTRModel, LightGCNBase):
 		out_dict['prediction'] = out_dict['prediction'].view(-1).sigmoid()
 		out_dict['label'] = feed_dict['label'].view(-1)
 		return out_dict
-
-class LightGCNImpression(ImpressionModel, LightGCNBase):
-	reader = 'ImpressionReader'
-	runner = 'ImpressionRunner'
-	extra_log_args = ['emb_size', 'n_layers', 'batch_size']
-
-	@staticmethod
-	def parse_model_args(parser):
-		parser = LightGCNBase.parse_model_args(parser)
-		return ImpressionModel.parse_model_args(parser)
-
-	def __init__(self, args, corpus):
-		ImpressionModel.__init__(self, args, corpus)
-		self._base_init(args, corpus)
-
-	def forward(self, feed_dict):
-		return LightGCNBase.forward(self, feed_dict)
 
 class LGCNEncoder(nn.Module):
 	def __init__(self, user_count, item_count, emb_size, norm_adj, n_layers=3, device=None):
